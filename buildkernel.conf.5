@@ -173,6 +173,9 @@ Most users will not need to override the default.
 When set to \fB0\fR the \fBbuildkernel\fR script will \fInot\fR
 create or modify EFI boot
 settings in NVRAM (if left unset, a value of \fB1\fR will be assumed).
+By default, the latest kernel is placed first in the EFI boot order and,
+when an automatically retained \fI.old\fR kernel is available, a separate
+entry for that previous kernel is placed second.
 Set to \fB0\fR only if you have your own EFI bootloader,
 or want to insert appropriate EFI boot settings manually.
 

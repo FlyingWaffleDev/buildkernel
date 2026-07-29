@@ -452,6 +452,7 @@ source_etc_conf_file() {
 }
 setup_final_variables() {
     # post-processing once buildkernel.conf loaded
+    FULLEFIBOOTDIR="${EFIROOTDIR}${EFIBOOTDIR}"
     # critical that EFIPARTUUID and CRYPTPARTUUID are defined...
     # (NB - buildkernel now also supports a LUKS filesystem that does not live
     # in a GPT partition - you can simply override CRYPTPATHMAP directly in
@@ -1473,11 +1474,11 @@ ask_whether_to_proceed() {
     fi
 }
 conform_efi_boot_order_if_possible() {
-    # checks if we have been booted under UEFI, and, if so, whether or not
-    # the EFIBOOTNAME is present, accurate, active, and at the top of the boot
-    # order; if all these conditions are met, does nothing, otherwise, deletes
-    # any old (clashing) entry for the EFIBOOTNAME, and inserts a new one
-    # (which automatically starts off active and at the top of the list)
+    # checks if we have been booted under UEFI, and, if so, whether or not the
+    # current and previous kernel entries are present, accurate, active, and at
+    # the top of the boot order. If all these conditions are met, does nothing;
+    # otherwise, deletes the managed entries and recreates them in the desired
+    # order (new entries automatically start off active and at the top).
     if ((USINGEFI==0)); then
         warning "Your system is not currently booted under EFI"
         warning "As such, unable to set EFI stub kernel in boot list"
@@ -1505,9 +1506,12 @@ conform_efi_boot_order_if_possible() {
     if ((EFIBOOTENTRIESSEARCHED==0)); then
         find_all_efi_boot_entries
     fi
-    # are we already at the top?
-    declare -i NEWBOOTENTRYNEEDED=1
     local SMBOOTPATH="${EFIBOOTDIR}/${EFIBOOTFILE}"
+    local SMPREVIOUSBOOTPATH="${SMBOOTPATH}${OLDSUFFIX}"
+    declare -i HAVEPREVIOUSKERNEL=0
+    if [ -s "${FULLEFIBOOTDIR}/${EFIBOOTFILE}${OLDSUFFIX}" ]; then
+        HAVEPREVIOUSKERNEL=1
+    fi
     # locate the EFIPARTUUID, if possible
     local EFIPARTPATH="${PARTUUIDDEVDIR}/${EFIPARTUUID}"
     if [ ! -e "${EFIPARTPATH}" ]; then
@@ -1531,45 +1535,79 @@ conform_efi_boot_order_if_possible() {
         DEVNAME="${PARTNAME%%[[:digit:]]*}"                 # e.g. /dev/sda
     fi
     local PARTNUM="${PARTNAME##*[^[:digit:]]}"              # e.g. 3
-    local BOOTLABEL
+    local BOOTLABEL PREVIOUSBOOTLABEL
     # label will reflect if desired EFI partition is on USB or not
     if partuuid_is_on_usb_device "${EFIPARTUUID}"; then
         BOOTLABEL="Gentoo Linux (USB Key)"
+        PREVIOUSBOOTLABEL="Gentoo Linux Previous (USB Key)"
     else
         BOOTLABEL="Gentoo Linux (Internal Drive)"
+        PREVIOUSBOOTLABEL="Gentoo Linux Previous (Internal Drive)"
     fi
     SMBOOTPATH="${SMBOOTPATH//\//\\}" # map boot file path to backslash separators
-    declare -i NUMBOOTORDERS="${#EBOOTORDER[@]}"
-    if ((NUMBOOTORDERS>0)); then
-        local FIRSTBOOTID="${EBOOTORDER[0]}"
-        # look this up - it may not match if the top item is e.g. a net boot
-        if [[ "${EBOOTIDTOINDEX[${FIRSTBOOTID}]+_}" ]]; then
-            declare -i IX="${EBOOTIDTOINDEX[${FIRSTBOOTID}]}"
-            # now check if this boot matches what we want; if so, leave it alone
-            if [[ "${EBOOTNAMES[${IX}]}" == "${BOOTLABEL}" && \
-                "${EBOOTPATHS[${IX}]}" == "${SMBOOTPATH}" && \
-                "${EBOOTUUIDS[${IX}]}" == "${EFIPARTUUID}" && \
-                "${EBOOTISACTIVES[${IX}]}" == "1" ]]; then
-                # all criteria met!
-                NEWBOOTENTRYNEEDED=0
+    SMPREVIOUSBOOTPATH="${SMPREVIOUSBOOTPATH//\//\\}"
+
+    declare -i CURRENTLABELCOUNT=0 CURRENTMATCHCOUNT=0
+    declare -i PREVIOUSLABELCOUNT=0 PREVIOUSMATCHCOUNT=0
+    local CURRENTBOOTID="" PREVIOUSBOOTID=""
+    declare -i I=0
+    for I in "${!EBOOTNAMES[@]}"; do
+        if [[ "${EBOOTNAMES[${I}]}" == "${BOOTLABEL}" ]]; then
+            CURRENTLABELCOUNT+=1
+            if [[ "${EBOOTPATHS[${I}]}" == "${SMBOOTPATH}" && \
+                "${EBOOTUUIDS[${I}]}" == "${EFIPARTUUID}" && \
+                "${EBOOTISACTIVES[${I}]}" == "1" ]]; then
+                CURRENTMATCHCOUNT+=1
+                CURRENTBOOTID="${EBOOTIDS[${I}]}"
+            fi
+        elif [[ "${EBOOTNAMES[${I}]}" == "${PREVIOUSBOOTLABEL}" ]]; then
+            PREVIOUSLABELCOUNT+=1
+            if [[ "${EBOOTPATHS[${I}]}" == "${SMPREVIOUSBOOTPATH}" && \
+                "${EBOOTUUIDS[${I}]}" == "${EFIPARTUUID}" && \
+                "${EBOOTISACTIVES[${I}]}" == "1" ]]; then
+                PREVIOUSMATCHCOUNT+=1
+                PREVIOUSBOOTID="${EBOOTIDS[${I}]}"
             fi
         fi
+    done
+
+    declare -i BOOTENTRIESCONFORMED=0
+    if ((CURRENTLABELCOUNT==1 && CURRENTMATCHCOUNT==1)) && \
+        ((${#EBOOTORDER[@]}>=1)) && \
+        [[ "${EBOOTORDER[0]}" == "${CURRENTBOOTID}" ]]; then
+        if ((HAVEPREVIOUSKERNEL==1)); then
+            if ((PREVIOUSLABELCOUNT==1 && PREVIOUSMATCHCOUNT==1)) && \
+                ((${#EBOOTORDER[@]}>=2)) && \
+                [[ "${EBOOTORDER[1]}" == "${PREVIOUSBOOTID}" ]]; then
+                BOOTENTRIESCONFORMED=1
+            fi
+        elif ((PREVIOUSLABELCOUNT==0)); then
+            BOOTENTRIESCONFORMED=1
+        fi
     fi
-    if ((NEWBOOTENTRYNEEDED==1)); then
+
+    if ((BOOTENTRIESCONFORMED==0)); then
         ensure_efivarfs_rw_if_present
-        # remove any existing bootnums with the same name first
-        declare -i I=0
+        # remove all managed entries, including duplicates and stale entries
         for I in "${!EBOOTNAMES[@]}"; do
-            if [[ "${EBOOTNAMES[${I}]}" == "${BOOTLABEL}" ]]; then
+            if [[ "${EBOOTNAMES[${I}]}" == "${BOOTLABEL}" || \
+                "${EBOOTNAMES[${I}]}" == "${PREVIOUSBOOTLABEL}" ]]; then
                 show "Deleting conflicting boot entry ${EBOOTIDS[${I}]} ('${EBOOTNAMES[${I}]}')"
                 efibootmgr --quiet --delete-bootnum --bootnum "${EBOOTIDS[${I}]}"
             fi
         done
-        show "Adding ('${BOOTLABEL}') to top of the EFI boot list"
+        # efibootmgr inserts each new entry at the top, so create the previous
+        # entry first and the current entry second.
+        if ((HAVEPREVIOUSKERNEL==1)); then
+            show "Adding ('${PREVIOUSBOOTLABEL}') to the EFI boot list"
+            efibootmgr --create --disk "${DEVNAME}" --part "${PARTNUM}" \
+                --loader "${SMPREVIOUSBOOTPATH}" --label "${PREVIOUSBOOTLABEL}"
+        fi
+        show "Adding ('${BOOTLABEL}') to the top of the EFI boot list"
         efibootmgr --create --disk "${DEVNAME}" --part "${PARTNUM}" --loader "${SMBOOTPATH}" --label "${BOOTLABEL}"
         restore_efivarfs_mount_state
     else
-        show "Appropriate entry already exists at the top of EFI boot list"
+        show "Appropriate entries already exist at the top of EFI boot list"
     fi
 }
 check_key_file_if_on_efi_system_partition () {

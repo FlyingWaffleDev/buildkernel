@@ -81,13 +81,15 @@ if you have a secure boot private key and public key certificate available in
 \fI/etc/efikeys/db.key\fR and \fI/etc/efikeys/db.crt\fR respectively,
 signs the kernel so it will secure boot;
 .IP \(bu 2
-backs up the old kernel and config on the EFI system partition, if any are present;
+backs up the old kernel and config on the EFI system partition, if any are
+present; these are retained with an \fI.old\fR suffix;
 .IP \(bu 2
 copies the newly built kernel (which is configured so as to be an EFI executable), into \fI/boot/efi/EFI/Boot/bootx64.efi\fR (the magic location expected by most UEFI BIOSes; you can override this \(em see \fBgenkenrnel.conf\fR(5)); and also copies the config to the same directory;
 .IP \(bu 2
-ensures that an EFI boot entry for the new kernel exists, and that it
-is placed at the top of the EFI boot order (N.B., it is only possible
-to do this if the system is currently booted under EFI); note that
+ensures that an EFI boot entry for the new kernel exists at the top of the EFI
+boot order and, when an automatically retained \fI.old\fR kernel is available,
+that a separate entry for it exists immediately afterward (N.B., it is only
+possible to do this if the system is currently booted under EFI); note that
 \fBbuildkernel\fR will temporarily make the special
 \fI/sys/firmware/efi/efivars\fR filesystem read-write, if required for
 these modifications to be made;
