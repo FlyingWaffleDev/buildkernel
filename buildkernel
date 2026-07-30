@@ -703,7 +703,16 @@ find_all_efi_boot_entries() {
         # local NEXTUUID=$(grep -E -o 'HD\([^(]*\)' <<<"${NEXTLINE}" | grep -E -o '[[:xdigit:]]{8}(\-[[:xdigit:]]{4}){3}\-[[:xdigit:]]{12}')
         local NEXTUUID=$(grep -E -o 'HD\([^(]*\)' <<<"${NEXTLINE}" | grep -E -o '[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}')
         local NEXTPATH=$(grep -E -o 'File\([^(]*\)' <<<"${NEXTLINE}")
-        NEXTPATH="${NEXTPATH:5:-1}"
+        if [ -n "${NEXTPATH}" ]; then
+            NEXTPATH="${NEXTPATH:5:-1}"
+        else
+            # efibootmgr v18 may render the file path directly after HD(...)
+            # rather than wrapping it in File(...).
+            local DIRECTPATHREGEX='HD\([^)]*\)/(\\[^[:space:]]+)'
+            if [[ "${NEXTLINE}" =~ ${DIRECTPATHREGEX} ]]; then
+                NEXTPATH="${BASH_REMATCH[1]}"
+            fi
+        fi
         local NEXTNAME="$(efibootmgr | grep "^${NEXTSIG}" | cut -c11- | cut -f1)"
         NEXTUUID="${NEXTUUID,,}"
         if [[ -z "${NEXTID}" || -z "${NEXTNAME}" || -z "${NEXTPATH}" || -z "${NEXTUUID}" || -z "${NEXTISACTIVE}" ]]; then
