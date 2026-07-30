@@ -26,3 +26,7 @@ Although **buildkernel** is targetted primarily at the use-case where the EFI sy
 Full instructions are provided as part of the [**Sakaki's EFI Install Guide**](https://wiki.gentoo.org/wiki/Sakaki's_EFI_Install_Guide) tutorial, on the Gentoo wiki.
 
 In particular, see [this section](https://wiki.gentoo.org/wiki/Sakaki's_EFI_Install_Guide/Configuring_and_Building_the_Kernel#What_the_buildkernel_Script_Does_.28Background_Reading.29) for a detailed description of what **buildkernel** does, and why.
+
+## Development checks
+
+Run `tests/run` from the repository root to execute Bash syntax checks, ShellCheck, and isolated regression tests. The tests do not mount devices, build a kernel, or modify EFI variables.

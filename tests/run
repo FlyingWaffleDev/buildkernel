@@ -1,0 +1,277 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+
+set -euo pipefail
+
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${TEST_DIR}/.." && pwd)"
+BUILDKERNEL="${PROJECT_DIR}/buildkernel"
+PASS_COUNT=0
+FAIL_COUNT=0
+
+fail() {
+    printf 'assertion failed: %s\n' "${1}" >&2
+    return 1
+}
+
+assert_eq() {
+    [[ "${1}" == "${2}" ]] || fail "expected '${2}', got '${1}'"
+}
+
+assert_file_contains() {
+    grep -Fqx -- "${2}" "${1}" || fail "${1} does not contain '${2}'"
+}
+
+load_buildkernel() {
+    trap - EXIT SIGHUP SIGQUIT SIGINT SIGTERM
+}
+
+# Load once at top level so declarations in the executable remain global.
+# shellcheck source=../buildkernel
+source "${BUILDKERNEL}"
+
+test_static_checks() {
+    bash -n "${BUILDKERNEL}"
+    shellcheck -x "${BUILDKERNEL}"
+    "${BUILDKERNEL}" --help >/dev/null
+    assert_eq "$("${BUILDKERNEL}" --version)" "1.0.37"
+    if "${BUILDKERNEL}" --adjustment=not-an-integer >/dev/null 2>&1; then
+        fail "invalid niceness adjustment was accepted"
+    fi
+}
+
+# shellcheck disable=SC2329
+test_failed_mount_is_not_remembered() {
+    load_buildkernel
+    ALLMOUNTS=()
+    mount() { return 1; }
+    if mount_and_remember /dev/fake /mnt/fake; then
+        fail "failed mount was reported as successful"
+    fi
+    [[ ! "${ALLMOUNTS[/mnt/fake]+set}" ]] || fail "failed mount was remembered"
+}
+
+# shellcheck disable=SC2329
+test_preexisting_mount_can_be_unmounted() {
+    load_buildkernel
+    local UNMOUNTED=""
+    ALLMOUNTS=()
+    findmnt() { return 0; }
+    umount() {
+        UNMOUNTED="${*: -1}"
+        return 0
+    }
+    unmount_path /mnt/preexisting
+    assert_eq "${UNMOUNTED}" "/mnt/preexisting"
+}
+
+# Test mocks and sourced globals are intentionally resolved at runtime.
+# shellcheck disable=SC2034,SC2329
+test_safe_directory_cleanup() {
+    load_buildkernel
+    local TEMP_ROOT
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    mkdir -p "${TEMP_ROOT}/boot/initramfs/subdir"
+    touch "${TEMP_ROOT}/boot/initramfs/normal"
+    touch "${TEMP_ROOT}/boot/initramfs/.hidden"
+    clear_directory_contents "${TEMP_ROOT}/boot/initramfs" "${TEMP_ROOT}/boot"
+    [[ -z "$(find "${TEMP_ROOT}/boot/initramfs" -mindepth 1 -print -quit)" ]] ||
+        fail "cleanup left entries behind"
+    if clear_directory_contents / /; then
+        fail "root directory was accepted for cleanup"
+    fi
+    if clear_directory_contents "" "${TEMP_ROOT}/boot"; then
+        fail "empty directory was accepted for cleanup"
+    fi
+}
+
+# shellcheck disable=SC2034,SC2329
+test_efi_parser_formats_and_ids() {
+    load_buildkernel
+    USINGEFI=1
+    efibootmgr() {
+        printf '%s\n' \
+            'BootCurrent: ABCD' \
+            'BootOrder: ABCD,1000' \
+            $'BootABCD* Gentoo Linux (Internal Drive)\tHD(1,GPT,11111111-2222-3333-4444-555555555555,0x800,0x1000)/File(\\EFI\\Boot\\bootx64.efi)' \
+            $'Boot1000* Gentoo Linux Previous (Internal Drive)\tHD(1,GPT,11111111-2222-3333-4444-555555555555,0x800,0x1000)/\\EFI\\Boot\\bootx64.efi.old'
+    }
+    find_all_efi_boot_entries
+    assert_eq "${#EBOOTIDS[@]}" "2"
+    assert_eq "${EBOOTIDS[0]}" "ABCD"
+    assert_eq "${EBOOTIDS[1]}" "1000"
+    assert_eq "${EBOOTPATHS[0]}" '\EFI\Boot\bootx64.efi'
+    assert_eq "${EBOOTPATHS[1]}" '\EFI\Boot\bootx64.efi.old'
+    assert_eq "${EBOOTORDER[*]}" "ABCD 1000"
+}
+
+# shellcheck disable=SC2016,SC2034,SC2329
+test_external_module_signing() {
+    load_buildkernel
+    local TEMP_ROOT SIGN_LOG
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    SIGN_LOG="${TEMP_ROOT}/signed"
+    MODULESDIR="${TEMP_ROOT}/modules"
+    NEWVERSION="linux-test"
+    LINUXDIR="${TEMP_ROOT}/kernel"
+    KERNEL_SIGNING_KEY="${TEMP_ROOT}/key"
+    KERNEL_SIGNING_CERT="${TEMP_ROOT}/cert"
+    ARG_REBUILD_EXTERNAL_MODULES=1
+    BUILT_EXTERNAL_MODULES=1
+    mkdir -p "${MODULESDIR}/test/extra" "${LINUXDIR}/scripts"
+    touch "${KERNEL_SIGNING_KEY}" "${KERNEL_SIGNING_CERT}"
+    touch "${MODULESDIR}/test/extra/module with spaces.ko"
+    printf '#!/bin/bash\nprintf "%%s\\n" "$4" >> "%s"\n' "${SIGN_LOG}" \
+        > "${LINUXDIR}/scripts/sign-file"
+    chmod +x "${LINUXDIR}/scripts/sign-file"
+    emerge() { return 0; }
+    rebuild_external_modules_if_necessary
+    assert_file_contains "${SIGN_LOG}" \
+        "${MODULESDIR}/test/extra/module with spaces.ko"
+
+    : > "${SIGN_LOG}"
+    emerge() { return 1; }
+    if rebuild_external_modules_if_necessary; then
+        fail "failed module rebuild was reported as successful"
+    fi
+    [[ ! -s "${SIGN_LOG}" ]] || fail "modules were signed after a failed rebuild"
+}
+
+# shellcheck disable=SC2034
+test_transactional_efi_install() {
+    load_buildkernel
+    local TEMP_ROOT
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    BOOTDIR="${TEMP_ROOT}/boot"
+    EFIROOTDIR="${TEMP_ROOT}/efi"
+    EFIBOOTDIR="/EFI/Boot"
+    FULLEFIBOOTDIR="${EFIROOTDIR}${EFIBOOTDIR}"
+    EFIBOOTFILE="bootx64.efi"
+    EFICONFIGFILE="config"
+    VMLINUZNAME="vmlinuz-test"
+    NEWVERSION="linux-test"
+    TARGETCONFIG="${BOOTDIR}/config-new"
+    VERBOSITY_ARGS=()
+    mkdir -p "${BOOTDIR}" "${FULLEFIBOOTDIR}"
+    printf 'new kernel\n' > "${BOOTDIR}/${VMLINUZNAME}"
+    printf 'new config\n' > "${TARGETCONFIG}"
+    printf 'old kernel\n' > "${FULLEFIBOOTDIR}/${EFIBOOTFILE}"
+    printf 'old config\n' > "${FULLEFIBOOTDIR}/${EFICONFIGFILE}"
+
+    install_new_efi_files_transactionally
+
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFIBOOTFILE}")" "new kernel"
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFICONFIGFILE}")" "new config"
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFIBOOTFILE}${OLDSUFFIX}")" "old kernel"
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFICONFIGFILE}${OLDSUFFIX}")" "old config"
+    [[ ! -e "${FULLEFIBOOTDIR}/${EFIBOOTFILE}.buildkernel-new" ]] ||
+        fail "staged kernel was left behind"
+}
+
+# shellcheck disable=SC2034,SC2329
+test_transaction_rollback() {
+    load_buildkernel
+    local TEMP_ROOT LIVE_KERNEL LIVE_CONFIG
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    BOOTDIR="${TEMP_ROOT}/boot"
+    EFIROOTDIR="${TEMP_ROOT}/efi"
+    EFIBOOTDIR="/EFI/Boot"
+    FULLEFIBOOTDIR="${EFIROOTDIR}${EFIBOOTDIR}"
+    EFIBOOTFILE="bootx64.efi"
+    EFICONFIGFILE="config"
+    VMLINUZNAME="vmlinuz-test"
+    NEWVERSION="linux-test"
+    TARGETCONFIG="${BOOTDIR}/config-new"
+    VERBOSITY_ARGS=()
+    LIVE_KERNEL="${FULLEFIBOOTDIR}/${EFIBOOTFILE}"
+    LIVE_CONFIG="${FULLEFIBOOTDIR}/${EFICONFIGFILE}"
+    mkdir -p "${BOOTDIR}" "${FULLEFIBOOTDIR}"
+    printf 'new kernel\n' > "${BOOTDIR}/${VMLINUZNAME}"
+    printf 'new config\n' > "${TARGETCONFIG}"
+    printf 'old kernel\n' > "${LIVE_KERNEL}"
+    printf 'old config\n' > "${LIVE_CONFIG}"
+    mv() {
+        if [[ "${2}" == *.buildkernel-new && "${3}" == "${LIVE_CONFIG}" ]]; then
+            return 1
+        fi
+        command mv "${@}"
+    }
+
+    if (install_new_efi_files_transactionally >/dev/null 2>&1); then
+        fail "transaction unexpectedly succeeded"
+    fi
+    assert_eq "$(cat "${LIVE_KERNEL}")" "old kernel"
+    assert_eq "$(cat "${LIVE_CONFIG}")" "old config"
+    [[ ! -e "${LIVE_KERNEL}.buildkernel-new" ]] ||
+        fail "staged kernel remained after rollback"
+}
+
+# shellcheck disable=SC2034,SC2329
+test_insufficient_space_preserves_live_files() {
+    load_buildkernel
+    local TEMP_ROOT KERNEL_SOURCE
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    FULLEFIBOOTDIR="${TEMP_ROOT}/efi/EFI/Boot"
+    TARGETCONFIG="${TEMP_ROOT}/config"
+    KERNEL_SOURCE="${TEMP_ROOT}/kernel"
+    mkdir -p "${FULLEFIBOOTDIR}"
+    dd if=/dev/zero of="${KERNEL_SOURCE}" bs=1024 count=4 status=none
+    dd if=/dev/zero of="${TARGETCONFIG}" bs=1024 count=4 status=none
+    printf 'live kernel\n' > "${FULLEFIBOOTDIR}/bootx64.efi"
+    df() { printf 'Avail\n1\n'; }
+    if check_efi_staging_space "${KERNEL_SOURCE}"; then
+        fail "insufficient space was accepted"
+    fi
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/bootx64.efi")" "live kernel"
+}
+
+# shellcheck disable=SC2034,SC2329
+test_configuration_round_trip() {
+    load_buildkernel
+    local TEMP_ROOT EXPECTED
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    CONFFILE="${TEMP_ROOT}/buildkernel.conf"
+    EFIROOTDIR="${TEMP_ROOT}/not-mounted"
+    PROCVARS=(TESTVALUE)
+    EXPECTED='spaces % "quotes" and \backslashes'
+    TESTVALUE="${EXPECTED}"
+    unset LUKSKEYFILE OLD_LUKSKEYFILE
+    : > "${CONFFILE}"
+    findmnt() { return 1; }
+    save_buildkernel_config
+    unset TESTVALUE
+    # shellcheck disable=SC1090
+    source "${CONFFILE}"
+    assert_eq "${TESTVALUE}" "${EXPECTED}"
+}
+
+run_test() {
+    local NAME="${1}" FUNCTION="${2}"
+    if ("${FUNCTION}"); then
+        printf 'ok - %s\n' "${NAME}"
+        ((PASS_COUNT += 1))
+    else
+        printf 'not ok - %s\n' "${NAME}" >&2
+        ((FAIL_COUNT += 1))
+    fi
+}
+
+run_test "static checks and early CLI options" test_static_checks
+run_test "failed mounts are not remembered" test_failed_mount_is_not_remembered
+run_test "pre-existing mounts can be unmounted" test_preexisting_mount_can_be_unmounted
+run_test "safe directory cleanup" test_safe_directory_cleanup
+run_test "EFI parser formats and high boot IDs" test_efi_parser_formats_and_ids
+run_test "external module signing" test_external_module_signing
+run_test "transactional EFI installation" test_transactional_efi_install
+run_test "EFI transaction rollback" test_transaction_rollback
+run_test "insufficient space preserves live files" test_insufficient_space_preserves_live_files
+run_test "configuration serialization round trip" test_configuration_round_trip
+
+printf '\n%d passed, %d failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
+((FAIL_COUNT == 0))
