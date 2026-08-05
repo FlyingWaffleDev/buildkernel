@@ -11,7 +11,9 @@ FAIL_COUNT=0
 
 fail() {
     printf 'assertion failed: %s\n' "${1}" >&2
-    return 1
+    # Every test runs in a subshell. Exit it immediately so a later successful
+    # command cannot hide an assertion failure while the test is in an `if`.
+    exit 1
 }
 
 assert_eq() {
@@ -34,7 +36,7 @@ test_static_checks() {
     bash -n "${BUILDKERNEL}"
     shellcheck -x "${BUILDKERNEL}"
     "${BUILDKERNEL}" --help >/dev/null
-    assert_eq "$("${BUILDKERNEL}" --version)" "1.0.37"
+    assert_eq "$("${BUILDKERNEL}" --version)" "1.0.38"
     if "${BUILDKERNEL}" --adjustment=not-an-integer >/dev/null 2>&1; then
         fail "invalid niceness adjustment was accepted"
     fi
@@ -106,6 +108,202 @@ test_efi_parser_formats_and_ids() {
     assert_eq "${EBOOTORDER[*]}" "ABCD 1000"
 }
 
+# Stateful efibootmgr mock used by the EFI conformance tests. The arrays are
+# dynamically scoped locals in each test, just like the rest of the test state.
+# shellcheck disable=SC2317,SC2329
+mock_efibootmgr() {
+    local COMMAND="${1:-}"
+    shift || true
+    if [[ "${COMMAND}" == "-v" ]]; then
+        printf 'BootOrder: %s\n' "${MOCK_ORDER}"
+        local I
+        for I in "${!MOCK_IDS[@]}"; do
+            local STAR=""
+            [[ "${MOCK_ACTIVE[${I}]}" == "1" ]] && STAR="*"
+            printf 'Boot%s%s %s\tHD(1,GPT,%s,0x800,0x1000)/File(%s)\n' \
+                "${MOCK_IDS[${I}]}" "${STAR}" "${MOCK_NAMES[${I}]}" \
+                "${MOCK_UUIDS[${I}]}" "${MOCK_PATHS[${I}]}"
+        done
+        return 0
+    fi
+
+    MOCK_CALLS+=("${COMMAND} $*")
+    if [[ "${COMMAND}" == "--quiet" ]]; then
+        local BOOTNUM="${*: -1}"
+        local -a NEW_IDS=() NEW_NAMES=() NEW_PATHS=() NEW_UUIDS=() NEW_ACTIVE=()
+        local I
+        for I in "${!MOCK_IDS[@]}"; do
+            if [[ "${MOCK_IDS[${I}]}" != "${BOOTNUM}" ]]; then
+                NEW_IDS+=("${MOCK_IDS[${I}]}")
+                NEW_NAMES+=("${MOCK_NAMES[${I}]}")
+                NEW_PATHS+=("${MOCK_PATHS[${I}]}")
+                NEW_UUIDS+=("${MOCK_UUIDS[${I}]}")
+                NEW_ACTIVE+=("${MOCK_ACTIVE[${I}]}")
+            fi
+        done
+        MOCK_IDS=("${NEW_IDS[@]}"); MOCK_NAMES=("${NEW_NAMES[@]}")
+        MOCK_PATHS=("${NEW_PATHS[@]}"); MOCK_UUIDS=("${NEW_UUIDS[@]}")
+        MOCK_ACTIVE=("${NEW_ACTIVE[@]}")
+        local -a NEW_ORDER=()
+        local ID
+        IFS=',' read -r -a NEW_ORDER <<<"${MOCK_ORDER}"
+        MOCK_ORDER=""
+        for ID in "${NEW_ORDER[@]}"; do
+            [[ "${ID}" == "${BOOTNUM}" ]] && continue
+            MOCK_ORDER+="${MOCK_ORDER:+,}${ID}"
+        done
+    elif [[ "${COMMAND}" == "--create" ]]; then
+        [[ "${MOCK_IGNORE_CREATE}" == "1" ]] && return 0
+        local LOADER="" LABEL=""
+        while (($#)); do
+            case "${1}" in
+                --loader) LOADER="${2}"; shift 2 ;;
+                --label) LABEL="${2}"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        local NEW_ID
+        printf -v NEW_ID '%04X' "${MOCK_NEXT_ID}"
+        MOCK_NEXT_ID=$((MOCK_NEXT_ID + 1))
+        MOCK_IDS+=("${NEW_ID}"); MOCK_NAMES+=("${LABEL}")
+        MOCK_PATHS+=("${LOADER}"); MOCK_UUIDS+=("${EFIPARTUUID}")
+        MOCK_ACTIVE+=("1")
+        MOCK_ORDER="${NEW_ID}${MOCK_ORDER:+,${MOCK_ORDER}}"
+    elif [[ "${COMMAND}" == "--bootorder" ]]; then
+        [[ "${MOCK_REJECT_ORDER}" == "1" ]] && return 1
+        [[ "${MOCK_IGNORE_ORDER}" == "1" ]] || MOCK_ORDER="${1}"
+    else
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2178,SC2329
+setup_efi_conformance_test() {
+    EFIROOTDIR="${TEMP_ROOT}/efi"
+    EFIBOOTDIR="/EFI/Boot"
+    FULLEFIBOOTDIR="${EFIROOTDIR}${EFIBOOTDIR}"
+    EFIBOOTFILE="bootx64.efi"
+    EFIPARTUUID="11111111-2222-3333-4444-555555555555"
+    PARTUUIDDEVDIR="${TEMP_ROOT}/by-partuuid"
+    mkdir -p "${FULLEFIBOOTDIR}" "${PARTUUIDDEVDIR}" "${TEMP_ROOT}/dev"
+    touch "${TEMP_ROOT}/dev/sda1"
+    ln -s "${TEMP_ROOT}/dev/sda1" "${PARTUUIDDEVDIR}/${EFIPARTUUID}"
+    USINGEFI=1; CREATEEFIBOOT=1; EFIBOOTENTRIESSEARCHED=0
+    ONENTRYROEFIVARFS=0; EFIVARFSREMOUNTEDRW=0
+    ISUSBPART=(); ALLMOUNTS=()
+    MOCK_CALLS=(); MOCK_NEXT_ID=16
+    MOCK_IGNORE_CREATE=0; MOCK_REJECT_ORDER=0; MOCK_IGNORE_ORDER=0
+}
+
+# shellcheck disable=SC2034,SC2178,SC2329
+test_efi_reorders_valid_entries_without_recreation() {
+    load_buildkernel
+    local TEMP_ROOT
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    local -a MOCK_IDS=(0001 0002 0003 0004)
+    local -a MOCK_NAMES=('Gentoo Linux (Internal Drive)' 'Gentoo Linux Previous (Internal Drive)' 'Windows Boot Manager' 'Network Boot')
+    local -a MOCK_PATHS=('\EFI\Boot\bootx64.efi' '\EFI\Boot\bootx64.efi.old' '\EFI\Microsoft\Boot\bootmgfw.efi' '\EFI\net.efi')
+    local -a MOCK_UUIDS=('11111111-2222-3333-4444-555555555555' '11111111-2222-3333-4444-555555555555' 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' 'ffffffff-1111-2222-3333-444444444444')
+    local -a MOCK_ACTIVE=(1 1 1 1) MOCK_CALLS=()
+    local MOCK_ORDER='0002,0001,0003,0004,0003' MOCK_NEXT_ID
+    local MOCK_IGNORE_CREATE MOCK_REJECT_ORDER MOCK_IGNORE_ORDER
+    setup_efi_conformance_test
+    printf 'old kernel\n' > "${FULLEFIBOOTDIR}/${EFIBOOTFILE}${OLDSUFFIX}"
+    efibootmgr() { mock_efibootmgr "${@}"; }
+
+    conform_efi_boot_order_if_possible
+
+    assert_eq "${MOCK_ORDER}" '0001,0002,0003,0004'
+    assert_eq "${#MOCK_IDS[@]}" '4'
+    assert_eq "${MOCK_CALLS[*]}" '--bootorder 0001,0002,0003,0004'
+}
+
+# shellcheck disable=SC2034,SC2178,SC2329
+test_efi_recreates_stale_entries_and_orders_new_ids() {
+    load_buildkernel
+    local TEMP_ROOT
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    local -a MOCK_IDS=(0001 0003)
+    local -a MOCK_NAMES=('Gentoo Linux (Internal Drive)' 'Windows Boot Manager')
+    local -a MOCK_PATHS=('\EFI\Boot\wrong.efi' '\EFI\Microsoft\Boot\bootmgfw.efi')
+    local -a MOCK_UUIDS=('11111111-2222-3333-4444-555555555555' 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+    local -a MOCK_ACTIVE=(1 1) MOCK_CALLS=()
+    local MOCK_ORDER='0003,0001' MOCK_NEXT_ID
+    local MOCK_IGNORE_CREATE MOCK_REJECT_ORDER MOCK_IGNORE_ORDER
+    setup_efi_conformance_test
+    printf 'old kernel\n' > "${FULLEFIBOOTDIR}/${EFIBOOTFILE}${OLDSUFFIX}"
+    efibootmgr() { mock_efibootmgr "${@}"; }
+
+    conform_efi_boot_order_if_possible
+
+    assert_eq "${MOCK_ORDER}" '0011,0010,0003'
+    assert_eq "${MOCK_IDS[*]}" '0003 0010 0011'
+    assert_eq "${MOCK_PATHS[1]}" '\EFI\Boot\bootx64.efi.old'
+    assert_eq "${MOCK_PATHS[2]}" '\EFI\Boot\bootx64.efi'
+}
+
+# shellcheck disable=SC2034,SC2178,SC2329
+test_efi_removes_previous_when_no_fallback_exists() {
+    load_buildkernel
+    local TEMP_ROOT
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    local -a MOCK_IDS=(0001 0002 0003)
+    local -a MOCK_NAMES=('Gentoo Linux (Internal Drive)' 'Gentoo Linux Previous (Internal Drive)' 'Windows Boot Manager')
+    local -a MOCK_PATHS=('\EFI\Boot\bootx64.efi' '\EFI\Boot\bootx64.efi.old' '\EFI\Microsoft\Boot\bootmgfw.efi')
+    local -a MOCK_UUIDS=('11111111-2222-3333-4444-555555555555' '11111111-2222-3333-4444-555555555555' 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+    local -a MOCK_ACTIVE=(1 1 1) MOCK_CALLS=()
+    local MOCK_ORDER='0002,0003,0001' MOCK_NEXT_ID
+    local MOCK_IGNORE_CREATE MOCK_REJECT_ORDER MOCK_IGNORE_ORDER
+    setup_efi_conformance_test
+    efibootmgr() { mock_efibootmgr "${@}"; }
+
+    conform_efi_boot_order_if_possible
+
+    assert_eq "${MOCK_ORDER}" '0010,0003'
+    assert_eq "${MOCK_IDS[*]}" '0003 0010'
+    [[ "${MOCK_NAMES[*]}" != *'Previous'* ]] || fail 'Previous entry was retained'
+}
+
+# shellcheck disable=SC2034,SC2178,SC2329
+test_efi_conformance_failures_are_fatal() {
+    load_buildkernel
+    local TEMP_ROOT
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    local -a MOCK_IDS=(0003)
+    local -a MOCK_NAMES=('Windows Boot Manager')
+    local -a MOCK_PATHS=('\EFI\Microsoft\Boot\bootmgfw.efi')
+    local -a MOCK_UUIDS=('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+    local -a MOCK_ACTIVE=(1) MOCK_CALLS=()
+    local MOCK_ORDER='0003' MOCK_NEXT_ID
+    local MOCK_IGNORE_CREATE MOCK_REJECT_ORDER MOCK_IGNORE_ORDER
+    setup_efi_conformance_test
+    MOCK_IGNORE_CREATE=1
+    efibootmgr() { mock_efibootmgr "${@}"; }
+    if (conform_efi_boot_order_if_possible >/dev/null 2>&1); then
+        fail 'unidentifiable recreated entry was accepted'
+    fi
+
+    MOCK_IGNORE_CREATE=0
+    MOCK_IDS=(0001 0003)
+    MOCK_NAMES=('Gentoo Linux (Internal Drive)' 'Windows Boot Manager')
+    MOCK_PATHS=('\EFI\Boot\bootx64.efi' '\EFI\Microsoft\Boot\bootmgfw.efi')
+    MOCK_UUIDS=('11111111-2222-3333-4444-555555555555' 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+    MOCK_ACTIVE=(1 1); MOCK_ORDER='0003,0001'; MOCK_REJECT_ORDER=1
+    EFIBOOTENTRIESSEARCHED=0
+    if (conform_efi_boot_order_if_possible >/dev/null 2>&1); then
+        fail 'rejected BootOrder update was accepted'
+    fi
+
+    MOCK_REJECT_ORDER=0; MOCK_IGNORE_ORDER=1
+    if (conform_efi_boot_order_if_possible >/dev/null 2>&1); then
+        fail 'BootOrder update ignored by firmware was accepted'
+    fi
+}
+
 # shellcheck disable=SC2016,SC2034,SC2329
 test_external_module_signing() {
     load_buildkernel
@@ -169,6 +367,43 @@ test_transactional_efi_install() {
     assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFICONFIGFILE}${OLDSUFFIX}")" "old config"
     [[ ! -e "${FULLEFIBOOTDIR}/${EFIBOOTFILE}.buildkernel-new" ]] ||
         fail "staged kernel was left behind"
+}
+
+# shellcheck disable=SC2034,SC2178,SC2329
+test_one_run_install_and_efi_conformance() {
+    load_buildkernel
+    local TEMP_ROOT
+    TEMP_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEMP_ROOT}"' RETURN
+    local -a MOCK_IDS=(0001 0002 0003)
+    local -a MOCK_NAMES=('Gentoo Linux (Internal Drive)' 'Gentoo Linux Previous (Internal Drive)' 'Windows Boot Manager')
+    local -a MOCK_PATHS=('\EFI\Boot\bootx64.efi' '\EFI\Boot\bootx64.efi.old' '\EFI\Microsoft\Boot\bootmgfw.efi')
+    local -a MOCK_UUIDS=('11111111-2222-3333-4444-555555555555' '11111111-2222-3333-4444-555555555555' 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+    local -a MOCK_ACTIVE=(1 1 1) MOCK_CALLS=()
+    local MOCK_ORDER='0002,0003,0001' MOCK_NEXT_ID
+    local MOCK_IGNORE_CREATE MOCK_REJECT_ORDER MOCK_IGNORE_ORDER
+    setup_efi_conformance_test
+    BOOTDIR="${TEMP_ROOT}/boot"
+    VMLINUZNAME="vmlinuz-test"
+    NEWVERSION="linux-test"
+    TARGETCONFIG="${BOOTDIR}/config-new"
+    EFICONFIGFILE="config"
+    VERBOSITY_ARGS=()
+    mkdir -p "${BOOTDIR}"
+    printf 'new kernel\n' > "${BOOTDIR}/${VMLINUZNAME}"
+    printf 'new config\n' > "${TARGETCONFIG}"
+    printf 'old kernel\n' > "${FULLEFIBOOTDIR}/${EFIBOOTFILE}"
+    printf 'old config\n' > "${FULLEFIBOOTDIR}/${EFICONFIGFILE}"
+    efibootmgr() { mock_efibootmgr "${@}"; }
+
+    install_new_efi_files_transactionally
+    conform_efi_boot_order_if_possible
+
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFIBOOTFILE}")" 'new kernel'
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFIBOOTFILE}${OLDSUFFIX}")" 'old kernel'
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFICONFIGFILE}")" 'new config'
+    assert_eq "$(cat "${FULLEFIBOOTDIR}/${EFICONFIGFILE}${OLDSUFFIX}")" 'old config'
+    assert_eq "${MOCK_ORDER}" '0001,0002,0003'
 }
 
 # shellcheck disable=SC2034,SC2329
@@ -267,8 +502,13 @@ run_test "failed mounts are not remembered" test_failed_mount_is_not_remembered
 run_test "pre-existing mounts can be unmounted" test_preexisting_mount_can_be_unmounted
 run_test "safe directory cleanup" test_safe_directory_cleanup
 run_test "EFI parser formats and high boot IDs" test_efi_parser_formats_and_ids
+run_test "EFI reorders valid entries without recreation" test_efi_reorders_valid_entries_without_recreation
+run_test "EFI recreates stale entries and discovers new IDs" test_efi_recreates_stale_entries_and_orders_new_ids
+run_test "EFI removes Previous when no fallback exists" test_efi_removes_previous_when_no_fallback_exists
+run_test "EFI conformance failures are fatal" test_efi_conformance_failures_are_fatal
 run_test "external module signing" test_external_module_signing
 run_test "transactional EFI installation" test_transactional_efi_install
+run_test "one-run install and EFI conformance" test_one_run_install_and_efi_conformance
 run_test "EFI transaction rollback" test_transaction_rollback
 run_test "insufficient space preserves live files" test_insufficient_space_preserves_live_files
 run_test "configuration serialization round trip" test_configuration_round_trip

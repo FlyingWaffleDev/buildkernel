@@ -1543,9 +1543,8 @@ ask_whether_to_proceed() {
 conform_efi_boot_order_if_possible() {
     # checks if we have been booted under UEFI, and, if so, whether or not the
     # current and previous kernel entries are present, accurate, active, and at
-    # the top of the boot order. If all these conditions are met, does nothing;
-    # otherwise, deletes the managed entries and recreates them in the desired
-    # order (new entries automatically start off active and at the top).
+    # the top of the boot order. Entry validity and ordering are handled
+    # separately: valid entries are reused, and BootOrder is set explicitly.
     if ((USINGEFI==0)); then
         warning "Your system is not currently booted under EFI"
         warning "As such, unable to set EFI stub kernel in boot list"
@@ -1571,7 +1570,10 @@ conform_efi_boot_order_if_possible() {
         return 0
     fi
     if ((EFIBOOTENTRIESSEARCHED==0)); then
-        find_all_efi_boot_entries
+        if ! find_all_efi_boot_entries; then
+            warning "Cannot conform EFI boot list"
+            return 0
+        fi
     fi
     local SMBOOTPATH="${EFIBOOTDIR}/${EFIBOOTFILE}"
     local SMPREVIOUSBOOTPATH="${SMBOOTPATH}${OLDSUFFIX}"
@@ -1639,24 +1641,21 @@ conform_efi_boot_order_if_possible() {
         fi
     done
 
-    declare -i BOOTENTRIESCONFORMED=0
-    if ((CURRENTLABELCOUNT==1 && CURRENTMATCHCOUNT==1)) && \
-        ((${#EBOOTORDER[@]}>=1)) && \
-        [[ "${EBOOTORDER[0]}" == "${CURRENTBOOTID}" ]]; then
+    declare -i BOOTENTRIESVALID=0
+    if ((CURRENTLABELCOUNT==1 && CURRENTMATCHCOUNT==1)); then
         if ((HAVEPREVIOUSKERNEL==1)); then
-            if ((PREVIOUSLABELCOUNT==1 && PREVIOUSMATCHCOUNT==1)) && \
-                ((${#EBOOTORDER[@]}>=2)) && \
-                [[ "${EBOOTORDER[1]}" == "${PREVIOUSBOOTID}" ]]; then
-                BOOTENTRIESCONFORMED=1
+            if ((PREVIOUSLABELCOUNT==1 && PREVIOUSMATCHCOUNT==1)); then
+                BOOTENTRIESVALID=1
             fi
         elif ((PREVIOUSLABELCOUNT==0)); then
-            BOOTENTRIESCONFORMED=1
+            BOOTENTRIESVALID=1
         fi
     fi
 
-    if ((BOOTENTRIESCONFORMED==0)); then
+    # Keep the existing repair behaviour for missing, stale, inactive or
+    # duplicate managed entries. Their position in BootOrder is handled below.
+    if ((BOOTENTRIESVALID==0)); then
         ensure_efivarfs_rw_if_present
-        # remove all managed entries, including duplicates and stale entries
         for I in "${!EBOOTNAMES[@]}"; do
             if [[ "${EBOOTNAMES[${I}]}" == "${BOOTLABEL}" || \
                 "${EBOOTNAMES[${I}]}" == "${PREVIOUSBOOTLABEL}" ]]; then
@@ -1664,19 +1663,82 @@ conform_efi_boot_order_if_possible() {
                 efibootmgr --quiet --delete-bootnum --bootnum "${EBOOTIDS[${I}]}"
             fi
         done
-        # efibootmgr inserts each new entry at the top, so create the previous
-        # entry first and the current entry second.
         if ((HAVEPREVIOUSKERNEL==1)); then
             show "Adding ('${PREVIOUSBOOTLABEL}') to the EFI boot list"
             efibootmgr --create --disk "${DEVNAME}" --part "${PARTNUM}" \
                 --loader "${SMPREVIOUSBOOTPATH}" --label "${PREVIOUSBOOTLABEL}"
         fi
-        show "Adding ('${BOOTLABEL}') to the top of the EFI boot list"
-        efibootmgr --create --disk "${DEVNAME}" --part "${PARTNUM}" --loader "${SMBOOTPATH}" --label "${BOOTLABEL}"
-        restore_efivarfs_mount_state
-    else
-        show "Appropriate entries already exist at the top of EFI boot list"
+        show "Adding ('${BOOTLABEL}') to the EFI boot list"
+        efibootmgr --create --disk "${DEVNAME}" --part "${PARTNUM}" \
+            --loader "${SMBOOTPATH}" --label "${BOOTLABEL}"
+
+        # Refresh to discover the boot IDs assigned to the new entries.
+        if ! find_all_efi_boot_entries; then
+            die "Unable to read recreated EFI boot entries"
+        fi
+        CURRENTBOOTID=""; PREVIOUSBOOTID=""
+        for I in "${!EBOOTNAMES[@]}"; do
+            if [[ "${EBOOTNAMES[${I}]}" == "${BOOTLABEL}" && \
+                "${EBOOTPATHS[${I}]}" == "${SMBOOTPATH}" && \
+                "${EBOOTUUIDS[${I}]}" == "${EFIPARTUUID}" && \
+                "${EBOOTISACTIVES[${I}]}" == "1" ]]; then
+                [[ -z "${CURRENTBOOTID}" ]] || die "Unable to identify recreated Current EFI boot entry"
+                CURRENTBOOTID="${EBOOTIDS[${I}]}"
+            elif [[ "${EBOOTNAMES[${I}]}" == "${PREVIOUSBOOTLABEL}" && \
+                "${EBOOTPATHS[${I}]}" == "${SMPREVIOUSBOOTPATH}" && \
+                "${EBOOTUUIDS[${I}]}" == "${EFIPARTUUID}" && \
+                "${EBOOTISACTIVES[${I}]}" == "1" ]]; then
+                [[ -z "${PREVIOUSBOOTID}" ]] || die "Unable to identify recreated Previous EFI boot entry"
+                PREVIOUSBOOTID="${EBOOTIDS[${I}]}"
+            fi
+        done
+        [[ -n "${CURRENTBOOTID}" ]] || die "Unable to identify recreated Current EFI boot entry"
+        if ((HAVEPREVIOUSKERNEL==1)); then
+            [[ -n "${PREVIOUSBOOTID}" ]] || die "Unable to identify recreated Previous EFI boot entry"
+        else
+            [[ -z "${PREVIOUSBOOTID}" ]] || die "Unable to remove Previous EFI boot entry"
+        fi
     fi
+
+    # Put the managed entries first and preserve all other entries in their
+    # existing relative order, omitting duplicates.
+    local -a DESIREDBOOTORDER=("${CURRENTBOOTID}")
+    if ((HAVEPREVIOUSKERNEL==1)); then
+        DESIREDBOOTORDER+=("${PREVIOUSBOOTID}")
+    fi
+    local -A BOOTIDSEEN=(["${CURRENTBOOTID}"]=1)
+    if ((HAVEPREVIOUSKERNEL==1)); then
+        BOOTIDSEEN["${PREVIOUSBOOTID}"]=1
+    fi
+    local NEXTBOOTID
+    for NEXTBOOTID in "${EBOOTORDER[@]}"; do
+        if [[ ! "${BOOTIDSEEN[${NEXTBOOTID}]+set}" ]]; then
+            DESIREDBOOTORDER+=("${NEXTBOOTID}")
+            BOOTIDSEEN["${NEXTBOOTID}"]=1
+        fi
+    done
+    if [[ "${EBOOTORDER[*]}" != "${DESIREDBOOTORDER[*]}" ]]; then
+        local BOOTORDERARG
+        BOOTORDERARG="$(IFS=,; echo "${DESIREDBOOTORDER[*]}")"
+        ensure_efivarfs_rw_if_present
+        show "Setting EFI boot order to ${BOOTORDERARG}"
+        if ! efibootmgr --bootorder "${BOOTORDERARG}"; then
+            die "Unable to set EFI boot order"
+        fi
+        if ! find_all_efi_boot_entries; then
+            die "Unable to verify EFI boot order"
+        fi
+    fi
+
+    if ((${#EBOOTORDER[@]}<1)) || [[ "${EBOOTORDER[0]}" != "${CURRENTBOOTID}" ]]; then
+        die "Firmware did not retain the requested EFI boot order"
+    fi
+    if ((HAVEPREVIOUSKERNEL==1)) && \
+        { ((${#EBOOTORDER[@]}<2)) || [[ "${EBOOTORDER[1]}" != "${PREVIOUSBOOTID}" ]]; }; then
+        die "Firmware did not retain the requested EFI boot order"
+    fi
+    restore_efivarfs_mount_state
+    show "Appropriate entries exist at the top of EFI boot list"
 }
 check_key_file_if_on_efi_system_partition () {
     # We check for the presence of a key file ONLY if it is on the EFI system
